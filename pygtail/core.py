@@ -23,16 +23,19 @@
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 from __future__ import print_function
-from os import stat
+from os import stat, fstat
 from os.path import exists, getsize
-import sys
-import glob
-import string
+from datetime import datetime, timedelta
 import gzip
+import logging
+import signal
+import socket
+import sys
+import time
 from optparse import OptionParser
 
 __version__ = '0.5.3'
-
+logging.basicConfig(level=logging.DEBUG)
 
 PY3 = sys.version_info[0] == 3
 
@@ -58,32 +61,50 @@ class Pygtail(object):
                   only when we reach the end of the file (default: False)
     copytruncate  Support copytruncate-style log rotation (default: True)
     """
-    def __init__(self, filename, offset_file=None, paranoid=False, copytruncate=True):
+    def __init__(self, filename, offset_file=None, paranoid=False,
+                 copytruncate=True, wait_step=0.5, wait_timeout=20,
+                 host_name=None):
         self.filename = filename
         self.paranoid = paranoid
         self.copytruncate = copytruncate
+        self.wait_step = wait_step
+        self.wait_timeout = wait_timeout
+        self.time_waited = 0.0
         self._offset_file = offset_file or "%s.offset" % self.filename
-        self._offset_file_inode = 0
-        self._offset = 0
+        self._offset_file_inode = None
+        self._offset = None
+        self._dt_format = '%Y-%m-%dT%H:%M:%S.%f'
+        self._hostname = host_name or socket.gethostname().split('.')[0]
+        self._filename_format = '%(filename)s_%(host_name)s_%(log_hour)s.gz'
+        self._log_hour_format = '%Y%m%d%H'
         self._fh = None
-        self._rotated_logfile = None
+        self._rotated_logfiles = []
+        self._catching_up = False
+        self._last_log = None
 
-        # if offset file exists and non-empty, open and parse it
-        if exists(self._offset_file) and getsize(self._offset_file):
-            offset_fh = open(self._offset_file, "r")
-            (self._offset_file_inode, self._offset) = \
-                [int(line.strip()) for line in offset_fh]
-            offset_fh.close()
-            if self._offset_file_inode != stat(self.filename).st_ino or \
-                    stat(self.filename).st_size < self._offset:
-                # The inode has changed or filesize has reduced so the file
-                # might have been rotated.
-                # Look for the rotated file and process that if we find it.
-                self._rotated_logfile = self._determine_rotated_logfile()
+        self._parse_offset_file()
+
+        if self._last_log:
+            self._rotated_logfiles = self._determine_rotated_logfiles()
+            self._catching_up = bool(self._rotated_logfiles)
+
+        if (self._offset_file_inode != stat(self.filename).st_ino) or \
+                (stat(self.filename).st_size < self._offset):
+            # Fail hard, this needs inspection
+            logging.fatal(
+                "File was truncated, but NO rotated files were created. inode:"
+                " %s offset: %s current size: %s timestamp: %s filename: %s",
+                self._offset_file_inode,
+                self._offset,
+                stat(self.filename).st_size,
+                self._last_log,
+                self.filename
+            )
+            sys.exit(1)
 
     def __del__(self):
-        if self._filehandle():
-            self._filehandle().close()
+        self._update_offset_file()
+        self._fh.close()
 
     def __iter__(self):
         return self
@@ -95,20 +116,22 @@ class Pygtail(object):
         try:
             line = self._get_next_line()
         except StopIteration:
-            # we've reached the end of the file; if we're processing the
-            # rotated log file, we can continue with the actual file; otherwise
-            # update the offset file
-            if self._rotated_logfile:
-                self._rotated_logfile = None
-                self._fh.close()
-                self._offset = 0
-                # open up current logfile and continue
+            if self._catching_up:
+                logging.debug(
+                    "Finished processing %s, moving to %s",
+                    getattr(self._fh, 'filename') or getattr(self._fh, 'name'),
+                    self._rotated_logfiles and self._rotated_logfiles[0] or self.filename
+                )
+                self._reload()
+                self._catching_up = bool(self._rotated_logfiles)
+                # Start on the next rotated file
                 try:
                     line = self._get_next_line()
                 except StopIteration:  # oops, empty file
                     self._update_offset_file()
                     raise
             else:
+                logging.debug("StopIteration at the main file, exiting")
                 self._update_offset_file()
                 raise
 
@@ -152,18 +175,41 @@ class Pygtail(object):
             else:
                 raise
 
+    def _parse_offset_file(self):
+        # if offset file exists and non-empty, open and parse it
+        if exists(self._offset_file) and getsize(self._offset_file):
+            offset_fh = open(self._offset_file, "r")
+            offset_data = [line.strip() for line in offset_fh]
+            offset_fh.close()
+            self._offset_file_inode = int(offset_data[0])
+            self._offset = int(offset_data[1])
+            self._last_log = datetime.strptime(offset_data[2], self._dt_format)
+        else:
+            self._offset = 0
+
+    def _get_offset(self):
+        if self._offset is None:
+            self._parse_offset_file()
+
+        return self._offset
+
     def _filehandle(self):
         """
         Return a filehandle to the file being tailed, with the position set
         to the current offset.
         """
         if not self._fh or self._is_closed():
-            filename = self._rotated_logfile or self.filename
+            if self._rotated_logfiles:
+                filename = self._rotated_logfiles.pop(0)
+            else:
+                filename = self.filename
+
             if filename.endswith('.gz'):
                 self._fh = gzip.open(filename, 'r')
             else:
                 self._fh = open(filename, "r")
-            self._fh.seek(self._offset)
+
+            self._fh.seek(self._get_offset())
 
         return self._fh
 
@@ -174,89 +220,118 @@ class Pygtail(object):
         offset = self._filehandle().tell()
         inode = stat(self.filename).st_ino
         fh = open(self._offset_file, "w")
-        fh.write("%s\n%s\n" % (inode, offset))
+        fh.write(
+            "%s\n%s\n%s\n" % (
+                inode,
+                offset,
+                datetime.now().strftime(self._dt_format)
+            )
+        )
         fh.close()
 
-    def _determine_rotated_logfile(self):
+    def _determine_rotated_logfiles(self):
         """
-        We suspect the logfile has been rotated, so try to guess what the
-        rotated filename is, and return it.
+        Looks up the rotated files and returns them.
         """
-        rotated_filename = self._check_rotated_filename_candidates()
-        if rotated_filename and exists(rotated_filename):
-            if stat(rotated_filename).st_ino == self._offset_file_inode:
-                return rotated_filename
+        end = datetime.now().replace(minute=0, second=0, microsecond=0)
+        start = self._last_log.replace(minute=0, second=0, microsecond=0)
+        elapsed_hours = int((end - start).total_seconds()) / 60 / 60
 
-            # if the inode hasn't changed, then the file shrank; this is expected with copytruncate,
-            # otherwise print a warning
-            if stat(self.filename).st_ino == self._offset_file_inode:
-                if self.copytruncate:
-                    return rotated_filename
-                else:
-                    sys.stderr.write(
-                        "[pygtail] [WARN] file size of %s shrank, and copytruncate support is "
-                        "disabled (expected at least %d bytes, was %d bytes).\n" %
-                        (self.filename, self._offset, stat(self.filename).st_size))
+        if not elapsed_hours:
+            return []
 
-        return None
+        files_list = []
+        while start < end:
+            candidate = self._filename_format % {
+                'filename': self.filename,
+                'host_name': self._hostname,
+                'log_hour': start.strftime(self._log_hour_format),
+            }
 
-    def _check_rotated_filename_candidates(self):
-        """
-        Check for various rotated logfile filename patterns and return the first
-        match we find.
-        """
-        # savelog(8)
-        candidate = "%s.0" % self.filename
-        if (exists(candidate) and exists("%s.1.gz" % self.filename) and
-            (stat(candidate).st_mtime > stat("%s.1.gz" % self.filename).st_mtime)):
-            return candidate
+            if exists(candidate):
+                files_list.append(candidate)
+            start += timedelta(hours=1)
 
-        # logrotate(8)
-        # with delaycompress
-        candidate = "%s.1" % self.filename
-        if exists(candidate):
-            return candidate
+        return files_list
 
-        # without delaycompress
-        candidate = "%s.1.gz" % self.filename
-        if exists(candidate):
-            return candidate
+    def _reload(self):
+        self._fh.close()
+        self._offset = 0
 
-        # dateext rotation scheme
-        candidates = glob.glob("%s-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]" % self.filename)
-        if candidates:
-            candidates.sort()
-            return candidates[-1]  # return most recent
+    def _check_rotate_truncate(self):
+        fh = self._filehandle()
+        start_pos = fh.tell()
+        fh_ino = fstat(fh.fileno()).st_ino
 
-        # for TimedRotatingFileHandler
-        candidates = glob.glob("%s.[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]" % self.filename)
-        if candidates:
-            candidates.sort()
-            return candidates[-1]  # return most recent
+        try:
+            fh_stat = stat(self.filename)
+        except OSError:
+            logging.info("File moved, reloading...")
+            self._reload()
+            return
 
-        # no match
-        return None
+        current_ino = fh_stat.st_ino
+        current_size = fh_stat.st_size
+
+        if fh_ino != current_ino:
+            logging.info("File rotated, reloading...")
+            self._reload()
+
+        if self.copytruncate and (current_size < start_pos):
+            logging.info("File truncated, reloading...")
+            self._reload()
+
+    def _wait_for_update(self):
+        while(self.time_waited < self.wait_timeout):
+            time.sleep(self.wait_step)
+            self.time_waited += self.wait_step
+            line = self._filehandle().readline()
+            if line:
+                self.time_waited = 0.0
+                return line
+            self._check_rotate_truncate()
+        else:
+            raise StopIteration
 
     def _get_next_line(self):
         line = self._filehandle().readline()
         if not line:
-            raise StopIteration
+            if self._catching_up:
+                raise StopIteration
+            self._check_rotate_truncate()
+            return self._wait_for_update()
         return line
+
+    def exit_handler(self, signal, frame):
+        logging.info("Received exit signal, shutting down...")
+        sys.exit(0)
+
 
 def main():
     # command-line parsing
-    cmdline = OptionParser(usage="usage: %prog [options] logfile",
-        description="Print log file lines that have not been read.")
-    cmdline.add_option("--offset-file", "-o", action="store",
-        help="File to which offset data is written (default: <logfile>.offset).")
-    cmdline.add_option("--paranoid", "-p", action="store_true",
+    cmdline = OptionParser(
+        usage="usage: %prog [options] logfile",
+        description="Print log file lines that have not been read."
+    )
+    cmdline.add_option(
+        "--offset-file", "-o", action="store",
+        help="File to which offset data is written"
+             " (default: <logfile>.offset)."
+    )
+    cmdline.add_option(
+        "--paranoid", "-p", action="store_true",
         help="Update the offset file every time we read a line (as opposed to"
-             " only when we reach the end of the file).")
-    cmdline.add_option("--no-copytruncate", action="store_true",
-        help="Don't support copytruncate-style log rotation. Instead, if the log file"
-             " shrinks, print a warning.")
-    cmdline.add_option("--version", action="store_true",
-        help="Print version and exit.")
+             " only when we reach the end of the file)."
+    )
+    cmdline.add_option(
+        "--no-copytruncate", action="store_true",
+        help="Don't support copytruncate-style log rotation. Instead, if the"
+             " log file shrinks, print a warning."
+    )
+    cmdline.add_option(
+        "--version", action="store_true",
+        help="Print version and exit."
+    )
 
     options, args = cmdline.parse_args()
 
@@ -271,6 +346,9 @@ def main():
                       offset_file=options.offset_file,
                       paranoid=options.paranoid,
                       copytruncate=not options.no_copytruncate)
+
+    signal.signal(signal.SIGINT, pygtail.exit_handler)
+    signal.signal(signal.SIGTERM, pygtail.exit_handler)
 
     for line in pygtail:
         sys.stdout.write(line)
