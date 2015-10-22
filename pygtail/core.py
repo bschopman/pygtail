@@ -35,10 +35,8 @@ import time
 from optparse import OptionParser
 
 __version__ = '0.5.3'
-logging.basicConfig(level=logging.DEBUG)
 
 PY3 = sys.version_info[0] == 3
-
 if PY3:
     text_type = str
 else:
@@ -308,6 +306,8 @@ class Pygtail(object):
 
 
 def main():
+    logging.basicConfig(level=logging.DEBUG)
+
     # command-line parsing
     cmdline = OptionParser(
         usage="usage: %prog [options] logfile",
