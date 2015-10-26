@@ -86,8 +86,9 @@ class Pygtail(object):
             self._rotated_logfiles = self._determine_rotated_logfiles()
             self._catching_up = bool(self._rotated_logfiles)
 
-        if (self._offset_file_inode != stat(self.filename).st_ino) or \
-                (stat(self.filename).st_size < self._offset):
+        if self._offset_file_inode and (
+                (self._offset_file_inode != stat(self.filename).st_ino) or
+                (stat(self.filename).st_size < self._offset)):
             # Fail hard, this needs inspection
             logging.fatal(
                 "File was truncated, but NO rotated files were created. inode:"
