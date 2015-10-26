@@ -215,6 +215,9 @@ class Pygtail(object):
         """
         Update the offset file with the current inode and offset.
         """
+        if self._is_closed():
+            logging.warn('Not writing to offset file, because fd is closed.')
+            return
         offset = self._filehandle().tell()
         inode = stat(self.filename).st_ino
         fh = open(self._offset_file, "w")
