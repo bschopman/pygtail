@@ -284,7 +284,7 @@ class Pygtail(object):
             self._reload()
 
     def _wait_for_update(self):
-        while(self.time_waited < self.wait_timeout):
+        while(self.wait_timeout < 0 or self.time_waited < self.wait_timeout):
             time.sleep(self.wait_step)
             self.time_waited += self.wait_step
             line = self._filehandle().readline()
