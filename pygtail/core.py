@@ -79,31 +79,15 @@ class Pygtail(object):
         self._rotated_logfiles = []
         self._catching_up = False
         self._last_log = None
-
         self._parse_offset_file()
-
         if self._last_log:
             self._rotated_logfiles = self._determine_rotated_logfiles()
             self._catching_up = bool(self._rotated_logfiles)
 
-        if self._offset_file_inode and (
-                (self._offset_file_inode != stat(self.filename).st_ino) or
-                (stat(self.filename).st_size < self._offset)):
-            # Fail hard, this needs inspection
-            logging.fatal(
-                "File was truncated, but NO rotated files were created. inode:"
-                " %s offset: %s current size: %s timestamp: %s filename: %s",
-                self._offset_file_inode,
-                self._offset,
-                stat(self.filename).st_size,
-                self._last_log,
-                self.filename
-            )
-            sys.exit(1)
-
     def __del__(self):
         self._update_offset_file()
-        self._fh.close()
+        if not self._is_closed():
+            self._fh.close()
 
     def __iter__(self):
         return self
@@ -217,7 +201,6 @@ class Pygtail(object):
         Update the offset file with the current inode and offset.
         """
         if self._is_closed():
-            logging.warn('Not writing to offset file, because fd is closed.')
             return
         offset = self._filehandle().tell()
         inode = stat(self.filename).st_ino
